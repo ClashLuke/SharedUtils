@@ -16,7 +16,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     python_requires=">=3.8",
     long_description_content_type="text/markdown",
-    install_requires=[],
+    install_requires=["numpy"],
     classifiers=[
         # Trove classifiers
         # (https://pypi.python.org/pypi?%3Aaction=list_classifiers)
