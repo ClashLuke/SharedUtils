@@ -37,7 +37,12 @@ def try_except(default: typing.Optional[typing.Any] = None):
     return _decorator
 
 
-def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Callable[[], bool]):
+def return_false():
+    return False
+
+
+def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Callable[[], bool] = return_false,
+              retry: bool = False):
     """
     Used to call a function with multiple context objects (for example, 4 multiprocessing locks) while ensuring a
     condition stays false before entering the next context.
@@ -48,14 +53,20 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
     such as tf.control_dependencies and multiprocessing.Lock())
     :param fn: Function that will be called once all contexts are entered
     :param cond_fn: Callback called whenever a context is acquired, to ensure the function still has to run.
+    :param retry: whether to try try acquiring all locks again, or to raise an error
     :return: either none (-> cond = True) or output of fn
     """
     if not contexts:
         return fn()
     if cond_fn():
         return
-    with contexts.pop(0):
-        return call_with(contexts, fn, cond_fn)
+    try:
+        with contexts.pop(0):
+            return call_with(contexts, fn, cond_fn, False)
+    except Exception as exc:
+        if not retry:
+            raise exc
+    return call_with(contexts, fn, cond_fn, True)
 
 
 class ListQueue:
@@ -86,6 +97,10 @@ class ListQueue:
             self.list.append(obj)
             with self.cond:
                 self.cond.notify_all()
+
+
+class FiFoSemaphoreTimeout(multiprocessing.TimeoutError):
+    pass
 
 
 class FiFoSemaphore:
@@ -127,13 +142,14 @@ class FiFoSemaphore:
     Exit
     """
 
-    def __init__(self, value: int = 1):
+    def __init__(self, value: int = 1, timeout: int = 0):
         manager = multiprocessing.Manager()
         self._cond = multiprocessing.Condition(multiprocessing.Lock())
         self._value = manager.list([value])
         self._queue = ListQueue()
         self._value_lock = multiprocessing.Lock()
         self.max_value = value
+        self.timeout = timeout
 
     def __call__(self, val: int = 0):
         return FiFoSemaphoreContext(self, val)
@@ -145,7 +161,8 @@ class FiFoSemaphore:
             val = self.max_value + val
         with self._cond:
             while self._queue.list[0] != job_id or self._value[0] < val:
-                self._cond.wait()
+                if self._cond.wait(self.timeout if self.timeout > 0 else None):
+                    raise FiFoSemaphoreTimeout
             with self._value_lock:
                 self._value[0] -= val
             self._queue.get()
@@ -215,9 +232,10 @@ class SharedEXTQueue:
     write_index_lock: threading.Lock
     read_index_lock: threading.Lock
     dtype: np.dtype
+    safe: bool
 
     @classmethod
-    def from_shape(cls, *shape: int, dtype: np.dtype = np.uint8):
+    def from_shape(cls, *shape: int, dtype: np.dtype = np.uint8, safe: bool = False):
         self = cls()
         self.data_mem = SharedMemory(create=True, size=np.zeros(shape, dtype=dtype).nbytes)
         self.data = np.ndarray(shape, dtype=dtype, buffer=self.data_mem.buf)
@@ -227,21 +245,23 @@ class SharedEXTQueue:
         self.write_index_lock = manager.Lock()
         self.read_index_lock = manager.Lock()
         self.dtype = dtype
+        self.safe = safe
         return self
 
     @classmethod
-    def from_export(cls, data_name, data_shape, indices, write_index_lock, read_index_lock, dtype):
+    def from_export(cls, data_name, data_shape, indices, write_index_lock, read_index_lock, dtype, safe):
         self = cls()
         self.data_mem = SharedMemory(create=False, name=data_name)
         self.data = np.ndarray(data_shape, dtype=dtype, buffer=self.data_mem.buf)
         self.indices = indices
         self.write_index_lock = write_index_lock
         self.read_index_lock = read_index_lock
+        self.safe = safe
         return self
 
     def export(self):
         return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, \
-               self.dtype
+               self.dtype, self.safe
 
     def get(self):
         while True:
@@ -268,7 +288,11 @@ class SharedEXTQueue:
                 return
             idx, start, end = indices
             self.indices.insert(idx, (start, end))
-        self.data[start:end] = obj[:]  # we simply assume that the synchronisation overheads make the reader slower
+
+        def _write():
+            self.data[start:end] = obj[:]
+
+        call_with([self.read_index_lock] * self.safe, _write)
 
     def put(self, obj: np.ndarray):
         batches = obj.shape[0]
@@ -311,9 +335,11 @@ class SharedFiFoQueue:
     write_memory: FiFoSemaphore
     read_timeout: int
     dtype: np.dtype
+    safe: bool
 
     @classmethod
-    def from_shape(cls, *shape: int, exclusive: int = 128, read_timeout: int = 3, dtype: np.dtype= np.uint8):
+    def from_shape(cls, *shape: int, exclusive: int = 128, read_timeout: int = 3, dtype: np.dtype = np.uint8,
+                   safe: bool = False):
         self = cls()
         self.data_mem = SharedMemory(create=True, size=np.zeros(shape, dtype=dtype).nbytes)
         self.data = np.ndarray(shape, dtype=dtype, buffer=self.data_mem.buf)
@@ -323,10 +349,12 @@ class SharedFiFoQueue:
         self.write_memory = FiFoSemaphore(exclusive)
         self.read_timeout = read_timeout
         self.dtype = dtype
+        self.safe = safe
         return self
 
     @classmethod
-    def from_export(cls, data_name, data_shape, index_queue, read_from_memory, write_to_memory, read_timeout, dtype):
+    def from_export(cls, data_name, data_shape, index_queue, read_from_memory, write_to_memory, read_timeout, dtype,
+                    safe):
         self = cls()
         self.data_mem = SharedMemory(create=False, name=data_name)
         self.data = np.ndarray(data_shape, dtype=dtype, buffer=self.data_mem.buf)
@@ -334,11 +362,12 @@ class SharedFiFoQueue:
         self.read_memory = read_from_memory
         self.write_memory = write_to_memory
         self.read_timeout = read_timeout
+        self.safe = safe
         return self
 
     def export(self):
         return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, \
-               self.read_timeout, self.dtype
+               self.read_timeout, self.dtype, self.safe
 
     def get(self):
         while True:
@@ -363,8 +392,11 @@ class SharedFiFoQueue:
                 start = 0
             end = start + batches
             self.index_queue.put((start, end))
-        with self.write_memory(1):
-            self.data[start:end] = obj[:]  # we simply assume that the synchronisation overheads make the reader slower
+
+        def _write():
+            self.data[start:end] = obj[:]
+
+        call_with([self.write_memory(1)] + [self.read_memory()] * self.safe, _write)
 
     def put(self, obj: np.ndarray):
         batches = obj.shape[0]
@@ -385,6 +417,85 @@ class SharedFiFoQueue:
             call_with([self.write_memory(), self.read_memory(), self.index_queue.read_lock,
                        self.index_queue.write_lock], self._shift_left, _fits)
         self._put_item(obj)
+
+    def __bool__(self):
+        return bool(self.index_queue.list)
+
+
+class SimpleSharedQueue:
+    """
+    The memory allocation is similar to the ExtQueue above, however, this queue simulates single-threaded access by
+    fully locking access to the internal memory when one thread is reading or writing to it.
+    It might still give speedups compared to multiprocessing queues, as the copy overhead is lower. However, it won't be
+    as fast as the ExtQueue, which locks only a sequence of memory at the cost of decreased safety.
+    """
+
+    data_mem: SharedMemory
+    data: np.ndarray
+    lock: FiFoSemaphore
+    retry: bool
+    index_queue: ListQueue
+
+    @classmethod
+    def from_shape(cls, *shape: int, dtype: np.dtype = np.uint8, timeout: int = 1, retry: bool = True):
+        self = cls()
+        self.data_mem = SharedMemory(create=True, size=np.zeros(shape, dtype=dtype).nbytes)
+        self.data = np.ndarray(shape, dtype=dtype, buffer=self.data_mem.buf)
+        self.lock = FiFoSemaphore(1, timeout)
+        self.retry = retry
+        self.index_queue = ListQueue()
+        return self
+
+    @classmethod
+    def from_export(cls, data_name, lock, retry, index_queue):
+        self = cls()
+        self.data_mem = SharedMemory(create=False, name=data_name)
+        self.lock = lock
+        self.retry = retry
+        self.index_queue = index_queue
+        return self
+
+    def export(self):
+        return self.data_mem.name, self.data.shape, self.lock, self.retry, self.index_queue
+
+    def _get_data(self):
+        start, end = self.index_queue.get()
+        return self.data[start:end].copy()  # local clone, so share can be safely edited
+
+    def get(self):
+        while True:
+            return call_with([self.lock()], self._get_data, retry=self.retry)
+
+    def _shift_left(self):
+        local_list = list(self.index_queue.list)
+        min_start = local_list[0][0]
+        max_end = local_list[-1][1]
+        self.data[:max_end - min_start] = self.data[min_start:max_end]
+        self.index_queue.list[:] = [(start - min_start, end - min_start) for start, end in local_list]
+
+    def _put_item(self, obj: np.ndarray):
+        batches = obj.shape[0]
+        if self.index_queue.list:
+            _, start = self.index_queue.list[-1]
+            start += 1
+        else:
+            start = 0
+        end = start + batches
+        self.index_queue.put((start, end))
+        self.data[start:end] = obj[:]
+
+    def put(self, obj: np.ndarray):
+        batches = obj.shape[0]
+
+        def _fits():
+            return not self or self.index_queue.list[-1][1] + batches < self.data.shape[0]
+
+        # until new data fits into memory
+        while not _fits():
+            while self and self.index_queue.list[0][0] == 0:  # wait for anything to be read
+                time.sleep(2)
+            call_with([self.lock()], self._shift_left, _fits, self.retry)  # ensure _nothing_ else is reading or writing
+        return call_with([self.lock()], lambda: self._put_item(obj), retry=self.retry)
 
     def __bool__(self):
         return bool(self.index_queue.list)
