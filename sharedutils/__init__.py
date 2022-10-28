@@ -447,16 +447,17 @@ class SimpleSharedQueue:
         return self
 
     @classmethod
-    def from_export(cls, data_name, lock, retry, index_queue):
+    def from_export(cls, data_name, shape, dtype, lock, retry, index_queue):
         self = cls()
         self.data_mem = SharedMemory(create=False, name=data_name)
+        self.data = np.ndarray(shape, dtype=dtype, buffer=self.data_mem.buf)
         self.lock = lock
         self.retry = retry
         self.index_queue = index_queue
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.lock, self.retry, self.index_queue
+        return self.data_mem.name, self.data.shape, self.data.dtype, self.lock, self.retry, self.index_queue
 
     def _get_data(self):
         start, end = self.index_queue.get()
