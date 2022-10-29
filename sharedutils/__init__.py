@@ -1,13 +1,12 @@
 import datetime
 import multiprocessing
+import numpy as np
 import threading
 import time
 import traceback
 import typing
 import uuid
 from multiprocessing.shared_memory import SharedMemory
-
-import numpy as np
 
 
 def try_except(default: typing.Optional[typing.Any] = None):
@@ -69,6 +68,10 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
     return call_with(contexts, fn, cond_fn, True)
 
 
+class Timeout(multiprocessing.TimeoutError):
+    pass
+
+
 class ListQueue:
     """
     A reimplementation of multiprocessing's Queue with a public list attribute which can be inspected by any process
@@ -78,18 +81,20 @@ class ListQueue:
     displays tbe entire queue in order.
     """
 
-    def __init__(self):
+    def __init__(self, timeout: float = 0):
         manager = multiprocessing.Manager()
         self.list = manager.list()
         self.write_lock = manager.RLock()
         self.read_lock = manager.RLock()
         self.cond = manager.Condition(manager.Lock())
+        self.timeout = timeout
 
     def get(self):
         with self.read_lock:
             if not self.list:
                 with self.cond:
-                    self.cond.wait()
+                    if not self._cond.wait(self.timeout if self.timeout > 0 else None):
+                        raise Timeout
             return self.list.pop(0)
 
     def put(self, obj):
@@ -97,10 +102,6 @@ class ListQueue:
             self.list.append(obj)
             with self.cond:
                 self.cond.notify_all()
-
-
-class FiFoSemaphoreTimeout(multiprocessing.TimeoutError):
-    pass
 
 
 class FiFoSemaphore:
@@ -161,8 +162,8 @@ class FiFoSemaphore:
             val = self.max_value + val
         with self._cond:
             while self._queue.list[0] != job_id or self._value[0] < val:
-                if self._cond.wait(self.timeout if self.timeout > 0 else None):
-                    raise FiFoSemaphoreTimeout
+                if not self._cond.wait(self.timeout if self.timeout > 0 else None):
+                    raise Timeout
             with self._value_lock:
                 self._value[0] -= val
             self._queue.get()
@@ -260,8 +261,7 @@ class SharedEXTQueue:
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, \
-               self.dtype, self.safe
+        return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, self.dtype, self.safe
 
     def get(self):
         while True:
@@ -366,8 +366,7 @@ class SharedFiFoQueue:
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, \
-               self.read_timeout, self.dtype, self.safe
+        return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, self.read_timeout, self.dtype, self.safe
 
     def get(self):
         while True:
@@ -414,8 +413,9 @@ class SharedFiFoQueue:
             while self and self.index_queue.list[0][0] == 0:  # wait for anything to be read
                 time.sleep(2)
             # ensure _nothing_ else is reading or writing
-            call_with([self.write_memory(), self.read_memory(), self.index_queue.read_lock,
-                       self.index_queue.write_lock], self._shift_left, _fits)
+            call_with(
+                [self.write_memory(), self.read_memory(), self.index_queue.read_lock, self.index_queue.write_lock],
+                self._shift_left, _fits)
         self._put_item(obj)
 
     def __bool__(self):
@@ -437,13 +437,13 @@ class SimpleSharedQueue:
     index_queue: ListQueue
 
     @classmethod
-    def from_shape(cls, *shape: int, dtype: np.dtype = np.uint8, timeout: int = 1, retry: bool = True):
+    def from_shape(cls, *shape: int, dtype: np.dtype = np.uint8, timeout: float = 1, retry: bool = True):
         self = cls()
         self.data_mem = SharedMemory(create=True, size=np.zeros(shape, dtype=dtype).nbytes)
         self.data = np.ndarray(shape, dtype=dtype, buffer=self.data_mem.buf)
         self.lock = FiFoSemaphore(1, timeout)
         self.retry = retry
-        self.index_queue = ListQueue()
+        self.index_queue = ListQueue(timeout)
         return self
 
     @classmethod

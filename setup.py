@@ -10,7 +10,7 @@ setuptools.setup(
     name='sharedutils',
     license='BSD',
     description="Easy usage of Python's new SharedMemory for reduced memory and CPU cost",
-    version='0.0.2',
+    version='0.0.3',
     long_description=README,
     url='https://github.com/clashluke/sharedutils',
     packages=setuptools.find_packages(),
