@@ -52,20 +52,20 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
     such as tf.control_dependencies and multiprocessing.Lock())
     :param fn: Function that will be called once all contexts are entered
     :param cond_fn: Callback called whenever a context is acquired, to ensure the function still has to run.
-    :param retry: whether to try try acquiring all locks again, or to raise an error
+    :param retry: whether to try acquiring all locks again, or to raise an error
     :return: either none (-> cond = True) or output of fn
     """
-    if not contexts:
-        return fn()
-    if cond_fn():
-        return
-    try:
-        with contexts.pop(0):
-            return call_with(contexts, fn, cond_fn, False)
-    except Exception as exc:
-        if not retry:
-            raise exc
-    return call_with(contexts, fn, cond_fn, True)
+    while retry:
+        if not contexts:
+            return fn()
+        if cond_fn():
+            return
+        try:
+            with contexts[0]:
+                return call_with(contexts[1:], fn, cond_fn, False)
+        except Exception as exc:
+            if not retry:
+                raise exc
 
 
 class Timeout(multiprocessing.TimeoutError):
