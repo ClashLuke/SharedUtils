@@ -61,6 +61,7 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
     elif retry is True:
         retry = -2
     while retry != -1:
+        retry -= 1
         if not contexts:
             return fn()
         if cond_fn():
@@ -69,9 +70,8 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
             with contexts[0]:
                 return call_with(contexts[1:], fn, cond_fn, False)
         except Exception as exc:
-            if not retry:
+            if retry == -1:
                 raise exc
-        retry -= 1
 
 
 class Timeout(multiprocessing.TimeoutError):
@@ -493,19 +493,18 @@ class SimpleSharedQueue:
         self.index_queue.put((start, end))
         self.data[start:end] = obj[:]
 
+    def _fits(self, batches: int):
+        return not self or self.index_queue.list[-1][1] + batches < self.data.shape[0]
+
+    def _write(self, obj: np.ndarray):
+        if not self._fits(obj.shape[0]):
+            self._shift_left()
+        if not self._fits(obj.shape[0]):
+            raise ValueError("Doesn't fit after shift.")
+        self._put_item(obj)
+
     def put(self, obj: np.ndarray):
-        batches = obj.shape[0]
-
-        def _fits():
-            return not self or self.index_queue.list[-1][1] + batches < self.data.shape[0]
-
-        with self.lock():
-            # until new data fits into memory
-            while not _fits():
-                while self and self.index_queue.list[0][0] == 0:  # wait for anything to be read
-                    time.sleep(2)
-                self._shift_left()
-            self._put_item(obj)
+        call_with([self.lock()], lambda: self._write(obj), retry=self.retry)
 
     def __bool__(self):
         return bool(self.index_queue.list)
