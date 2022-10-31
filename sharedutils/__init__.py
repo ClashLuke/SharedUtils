@@ -491,12 +491,13 @@ class SimpleSharedQueue:
         def _fits():
             return not self or self.index_queue.list[-1][1] + batches < self.data.shape[0]
 
-        # until new data fits into memory
-        while not _fits():
-            while self and self.index_queue.list[0][0] == 0:  # wait for anything to be read
-                time.sleep(2)
-            call_with([self.lock()], self._shift_left, _fits, self.retry)  # ensure _nothing_ else is reading or writing
-        return call_with([self.lock()], lambda: self._put_item(obj), retry=self.retry)
+        with self.lock():
+            # until new data fits into memory
+            while not _fits():
+                while self and self.index_queue.list[0][0] == 0:  # wait for anything to be read
+                    time.sleep(2)
+                self._shift_left()
+            self._put_item(obj)
 
     def __bool__(self):
         return bool(self.index_queue.list)
