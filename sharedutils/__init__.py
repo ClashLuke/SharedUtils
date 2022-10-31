@@ -1,12 +1,13 @@
 import datetime
 import multiprocessing
-import numpy as np
 import threading
 import time
 import traceback
 import typing
 import uuid
 from multiprocessing.shared_memory import SharedMemory
+
+import numpy as np
 
 
 def try_except(default: typing.Optional[typing.Any] = None):
@@ -41,7 +42,7 @@ def return_false():
 
 
 def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Callable[[], bool] = return_false,
-              retry: bool = False):
+              retry: typing.Union[bool, int] = False):
     """
     Used to call a function with multiple context objects (for example, 4 multiprocessing locks) while ensuring a
     condition stays false before entering the next context.
@@ -52,10 +53,14 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
     such as tf.control_dependencies and multiprocessing.Lock())
     :param fn: Function that will be called once all contexts are entered
     :param cond_fn: Callback called whenever a context is acquired, to ensure the function still has to run.
-    :param retry: whether to try acquiring all locks again, or to raise an error
+    :param retry: whether to try acquiring all locks again, or to raise an error (or number of retries, -2 = infinity)
     :return: either none (-> cond = True) or output of fn
     """
-    while retry:
+    if retry is False:
+        retry = 0
+    elif retry is True:
+        retry = -2
+    while retry != -1:
         if not contexts:
             return fn()
         if cond_fn():
@@ -66,6 +71,7 @@ def call_with(contexts: list, fn: typing.Callable[[], None], cond_fn: typing.Cal
         except Exception as exc:
             if not retry:
                 raise exc
+        retry -= 1
 
 
 class Timeout(multiprocessing.TimeoutError):
@@ -261,7 +267,8 @@ class SharedEXTQueue:
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, self.dtype, self.safe
+        return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, \
+               self.dtype, self.safe
 
     def get(self):
         while True:
@@ -366,7 +373,8 @@ class SharedFiFoQueue:
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, self.read_timeout, self.dtype, self.safe
+        return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, \
+               self.read_timeout, self.dtype, self.safe
 
     def get(self):
         while True:
@@ -414,8 +422,8 @@ class SharedFiFoQueue:
                 time.sleep(2)
             # ensure _nothing_ else is reading or writing
             call_with(
-                [self.write_memory(), self.read_memory(), self.index_queue.read_lock, self.index_queue.write_lock],
-                self._shift_left, _fits)
+                    [self.write_memory(), self.read_memory(), self.index_queue.read_lock, self.index_queue.write_lock],
+                    self._shift_left, _fits)
         self._put_item(obj)
 
     def __bool__(self):
