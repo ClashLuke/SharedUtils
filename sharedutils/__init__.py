@@ -1,13 +1,12 @@
 import datetime
 import multiprocessing
+import numpy as np
 import threading
 import time
 import traceback
 import typing
 import uuid
 from multiprocessing.shared_memory import SharedMemory
-
-import numpy as np
 
 
 def try_except(default: typing.Optional[typing.Any] = None):
@@ -158,8 +157,8 @@ class FiFoSemaphore:
         self.max_value = value
         self.timeout = timeout
 
-    def __call__(self, val: int = 0):
-        return FiFoSemaphoreContext(self, val)
+    def __call__(self, val: int = 0, release_first: bool = False):
+        return FiFoSemaphoreContext(self, val, release_first)
 
     def acquire(self, val: int = 0):
         job_id = uuid.uuid4()
@@ -185,15 +184,20 @@ class FiFoSemaphore:
 
 
 class FiFoSemaphoreContext:
-    def __init__(self, semaphore: FiFoSemaphore, val: int):
+    def __init__(self, semaphore: FiFoSemaphore, val: int, release_first: bool = False):
         self.semaphore = semaphore
         self.val = val
+        self.release_first = release_first
+        self.on_enter = self.semaphore.acquire
+        self.on_exit = self.semaphore.release
+        if release_first:
+            self.on_enter, self.on_exit = self.on_exit, self.on_enter
 
     def __enter__(self):
-        self.semaphore.acquire(self.val)
+        self.on_enter(self.val)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.semaphore.release(self.val)
+        self.on_exit(self.val)
 
 
 class SharedEXTQueue:
@@ -267,8 +271,7 @@ class SharedEXTQueue:
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, \
-               self.dtype, self.safe
+        return self.data_mem.name, self.data.shape, self.indices, self.write_index_lock, self.read_index_lock, self.dtype, self.safe
 
     def get(self):
         while True:
@@ -373,8 +376,7 @@ class SharedFiFoQueue:
         return self
 
     def export(self):
-        return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, \
-               self.read_timeout, self.dtype, self.safe
+        return self.data_mem.name, self.data.shape, self.index_queue, self.read_memory, self.write_memory, self.read_timeout, self.dtype, self.safe
 
     def get(self):
         while True:
@@ -422,8 +424,8 @@ class SharedFiFoQueue:
                 time.sleep(2)
             # ensure _nothing_ else is reading or writing
             call_with(
-                    [self.write_memory(), self.read_memory(), self.index_queue.read_lock, self.index_queue.write_lock],
-                    self._shift_left, _fits)
+                [self.write_memory(), self.read_memory(), self.index_queue.read_lock, self.index_queue.write_lock],
+                self._shift_left, _fits)
         self._put_item(obj)
 
     def __bool__(self):
